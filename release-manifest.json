@@ -1,0 +1,20 @@
+{
+  "package": "pi-knowledge-triage-compactor",
+  "version": "0.1.0",
+  "archive": "pi-knowledge-triage-compactor-0.1.0.tgz",
+  "bytes": 40274,
+  "sha256": "751b6d640ddf7f8d2621263f492d170da0c4c4f09afaf1d90674110a1a69110a",
+  "npmIntegrity": "sha512-DHeUTMlgyrBmTUvByOwSZiEFZc8Ckj/YHMlQ0BrNXksLr3OI+SlGZAE/UqP9xgxmLrs9fEHYQRi9o+OTX9iDHQ==",
+  "files": 30,
+  "validation": {
+    "unitTestsPassed": 36,
+    "piIntegrationTestsPassed": 5,
+    "realLayaTestsPassed": 1,
+    "piVersions": [
+      "0.85.1",
+      "1.0.4"
+    ],
+    "networkDisabledDocker": true,
+    "published": false
+  }
+}

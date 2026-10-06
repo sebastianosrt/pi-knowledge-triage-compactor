@@ -1,0 +1,31 @@
+{
+  "name": "pi-knowledge-triage-compactor",
+  "version": "0.1.0",
+  "description": "Local Laya knowledge compaction and session archive retrieval for Pi, with native compaction fallback.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": ["pi-package", "pi-extension", "compaction", "laya", "knowledge-triage"],
+  "engines": { "node": ">=22.19.0" },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "pi": { "extensions": ["./src/extension.ts"] },
+  "files": ["src/", "scripts/", "docs/", "licenses/", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs",
+    "test:integration": "node --experimental-strip-types --test test/integration/*.test.mjs",
+    "test:laya": "node --experimental-strip-types --test test/real/*.test.mjs",
+    "triage:setup": "node --experimental-strip-types scripts/setup.ts",
+    "check": "npm run typecheck && npm test && npm run test:integration"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@types/node": "22.19.19",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
+  }
+}

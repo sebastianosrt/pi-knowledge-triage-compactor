@@ -1,0 +1,17 @@
+Pi Knowledge Triage Compactor
+
+The knowledge classification, retention and retrieval implementation is adapted
+from Knowledge Triage, Copyright 2026 The Knowledge Triage Authors, licensed
+under Apache-2.0. Reference revision: a6ceb01a.
+https://github.com/searchsim-org/cikm26-knowledge-triage
+
+This distribution modifies that implementation for Pi session archives,
+incremental extraction, local classification, bounded retrieval, and standalone
+extension packaging. Additional changes are described in CHANGELOG.md.
+
+Local classification uses Laya 0.3.27 (Apache-2.0):
+https://github.com/NandhaKishorM/laya
+Model: convaiinnovations/laya-multilingual (Apache-2.0), revision
+1720e3e3357cfe1e281542e223f8273b0890ca34.
+Laya, model weights, uv and Python are downloaded separately during setup;
+they are not bundled in the npm package. Their upstream licenses apply.
