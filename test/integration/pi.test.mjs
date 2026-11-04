@@ -18,6 +18,10 @@ test("actual Pi RPC loads retrieval by default, calls it, and preserves built-in
   assert.equal(result.details.result.archive_available, true);
   assert.match(result.content[0].text, /exact_value=0/);
   assert.ok(JSON.stringify(f.requests[0].messages).includes("exact_value=0"));
+  assert.deepEqual(f.requests[1].messages.slice(0, f.requests[0].messages.length), f.requests[0].messages);
+  assert.equal((JSON.stringify(f.requests[1].messages).match(/Archived knowledge \(/g) ?? []).length, 1);
+  const injections = (await f.rows()).filter(row => row.customType === "knowledge_triage_injection");
+  assert.equal(injections.length, 1);
   assert.equal(f.requests[0].max_tokens ?? f.requests[0].max_completion_tokens, 32768);
 });
 

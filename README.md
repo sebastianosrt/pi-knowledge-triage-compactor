@@ -54,7 +54,7 @@ Use `"query":"*"` to list records. Follow the returned `next_page` object unchan
 
 Retrieval returns exact records, original source references, pinned instructions, archive coverage, and pagination. It supplies JSON text, `details.result`, and structured content for Pi versions supporting it. Archived observations remain context hints to verify against their sources.
 
-Automatic retrieval injects relevant archived records before a model request, fitting complete records into available context and an 8,000-character ceiling. Explicit retrieval is limited to 32 KiB per response. The extension respects explicitly disabled tools and does not replace Pi's built-in tools, selected model, or thinking level.
+Automatic retrieval injects relevant archived records before a model request, fitting complete records into available context and an 8,000-character ceiling per block. Pi 1.4 or newer is required. Each block is recorded once with a session-entry anchor and stays at that position across tool calls, retries, and resume, allowing the model server to reuse its prompt cache. Changed results append once; previous blocks remain until normal compaction removes their anchors. These derived blocks are not extracted into the archive again. Explicit retrieval is limited to 32 KiB per response. The extension respects explicitly disabled tools and does not replace Pi's built-in tools, selected model, or thinking level.
 
 ## Storage and configuration
 

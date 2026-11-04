@@ -1,6 +1,7 @@
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildSessionProjection } from "@earendil-works/pi-coding-agent";
 import { createExtension } from "../src/extension.ts";
 import { writeSnapshot } from "../src/core/knowledge-triage.ts";
 
@@ -29,17 +30,25 @@ export async function fixture(t, classifier = { async classify(texts) { return t
   };
   const context = { hasUI: false, cwd: root, abort() { this.aborted = true; }, model: { contextWindow: 131072, maxTokens: 32768 },
     getSystemPrompt: () => "Answer accurately.",
-    sessionManager: { getSessionFile: () => file, getSessionId: () => "session", getBranch: () => [...branch] } };
+    sessionManager: { getSessionFile: () => file, getSessionId: () => "session", getBranch: () => [...branch],
+      buildSessionProjection: () => buildSessionProjection(branch.map((value, i) => ({
+        timestamp: new Date(i).toISOString(), ...value, parentId: i ? branch[i - 1].id : null,
+      }))) } };
   createExtension(pi, classifier ? { classifier } : {});
   t.after(() => handlers.get("session_shutdown")({}, context));
   return { root, file, branch, logs, handlers, tools, commands, context, messages, pi,
     disableTools() { active = []; },
     async archive(value) {
       const ref = await writeSnapshot(file, "session", value);
-      branch.push({ type: "compaction", id: `compact-${sequence++}`, firstKeptEntryId: "cut", details: { triage: ref, task_id: "task" } }); return ref;
+      branch.push({ type: "compaction", id: `compact-${sequence++}`, summary: "Earlier records are archived.",
+        tokensBefore: 80000, firstKeptEntryId: "cut", details: { triage: ref, task_id: "task" } }); return ref;
     },
     async retrieve(args) { return (await tools.get("triage_retrieve").execute("call", args, undefined, undefined, context)).details.result; },
-    async inject(text) { return handlers.get("context")({ messages: [{ role: "user", content: text, timestamp: 0 }] }, context); },
+    async inject(text) {
+      branch.push({ type: "message", id: `user-${sequence++}`, message: { role: "user", content: text, timestamp: sequence } });
+      return handlers.get("context")({ messages: context.sessionManager.buildSessionProjection().messages }, context);
+    },
+    async project() { return handlers.get("context")({ messages: context.sessionManager.buildSessionProjection().messages }, context); },
     async compact(signal = new AbortController().signal, cut = "cut") {
       return handlers.get("session_before_compact")({ branchEntries: [...branch], reason: "manual", willRetry: false, signal,
         preparation: { firstKeptEntryId: cut, previousSummary: "Previous summary", tokensBefore: 70000,
