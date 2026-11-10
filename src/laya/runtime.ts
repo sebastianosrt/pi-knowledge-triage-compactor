@@ -8,6 +8,7 @@ export class LayaUnavailable extends Error {}
 /** One instance per extension registration. Failed setup is retried only explicitly or in a new session. */
 export class LayaRuntime implements KnowledgeClassifier {
   private lifetime = new AbortController();
+  private preparing?: Promise<void>;
   private pending?: Promise<KnowledgeClassifier>;
   private classifier?: KnowledgeClassifier;
   private failure?: string;
@@ -17,15 +18,38 @@ export class LayaRuntime implements KnowledgeClassifier {
   setProgress(progress: (text: string) => void) { this.progress = progress; }
   reset() {
     this.lifetime.abort(); this.lifetime = new AbortController();
-    this.pending = undefined; this.classifier = undefined; this.failure = undefined; this.generation++;
+    this.pending = undefined; this.preparing = undefined; this.classifier = undefined; this.failure = undefined; this.generation++;
   }
   shutdown() { this.lifetime.abort(); }
   async status() {
     const custom = Boolean(process.env.PI_TRIAGE_PYTHON || process.env.PI_TRIAGE_MODEL_DIR);
     return { home: cacheHome(), ready: !this.failure && Boolean(this.classifier || (!custom && await installedRuntime(cacheHome()))),
-      setup_running: Boolean(this.pending), last_error: this.failure ?? null,
+      setup_running: Boolean(this.pending || this.preparing), last_error: this.failure ?? null,
       custom_runtime: custom,
       fallback: "pi", model_revision: "1720e3e3357cfe1e281542e223f8273b0890ca34" };
+  }
+  /** OMP cannot wait for installation inside its bounded compaction hook. */
+  startSetup(retry = false): void {
+    if (this.preparing || (this.failure && !retry)) return;
+    const generation = this.generation;
+    this.preparing = this.setup().then(() => {
+      if (generation === this.generation) this.progress("Local Laya is ready.");
+    }).catch(error => {
+      if (generation === this.generation && !this.lifetime.signal.aborted) {
+        this.failure = String(error).slice(0, 1800);
+        this.progress(`Laya setup failed: ${this.failure}`);
+      }
+    }).finally(() => { if (generation === this.generation) this.preparing = undefined; });
+  }
+  async classifyInBackground(texts: string[], signal?: AbortSignal, session?: string) {
+    signal?.throwIfAborted();
+    if (this.preparing) throw new LayaUnavailable("Laya setup is running in the background");
+    if (!this.failure && !this.classifier && !process.env.PI_TRIAGE_PYTHON && !process.env.PI_TRIAGE_MODEL_DIR &&
+        !await installedRuntime(cacheHome())) {
+      this.startSetup();
+      throw new LayaUnavailable("Laya setup started in the background");
+    }
+    return this.classify(texts, signal, session);
   }
   private async get(signal?: AbortSignal): Promise<KnowledgeClassifier> {
     signal?.throwIfAborted(); this.lifetime.signal.throwIfAborted();
@@ -44,7 +68,7 @@ export class LayaRuntime implements KnowledgeClassifier {
           combined.throwIfAborted();
           this.classifier = createLayaClassifier({ python, modelDirectory, worker });
         } else {
-          const config = await ensureRuntime(cacheHome(), combined, text => this.progress(text));
+          const config = await ensureRuntime(cacheHome(), combined, text => { if (generation === this.generation) this.progress(text); });
           combined.throwIfAborted();
           this.classifier = createLayaClassifier(config);
         }

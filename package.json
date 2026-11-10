@@ -9,11 +9,15 @@
   "os": ["linux"],
   "cpu": ["x64"],
   "pi": { "extensions": ["./src/extension.ts"] },
+  "omp": { "extensions": ["./src/extension.ts"] },
   "files": ["src/", "scripts/", "docs/", "licenses/", "README.md", "LICENSE", "NOTICE", "CHANGELOG.md"],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "test:integration": "node --experimental-strip-types --test test/integration/*.test.mjs",
+    "test:integration:omp": "node --experimental-strip-types --test test/omp/*.test.mjs",
+    "test:integration:omp-methods": "node --experimental-strip-types --test test/omp-methods/*.test.mjs",
+    "check:omp": "npm run typecheck && npm run test:integration:omp",
     "test:laya": "node --experimental-strip-types --test test/real/*.test.mjs",
     "triage:setup": "node --experimental-strip-types scripts/setup.ts",
     "check": "npm run typecheck && npm test && npm run test:integration"
@@ -21,6 +25,10 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": ">=1.4.0",
     "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "typebox": { "optional": true }
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "1.4.0",

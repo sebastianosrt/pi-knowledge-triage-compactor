@@ -18,13 +18,15 @@ const assistant = text => ({ role: "assistant", content: [{ type: "text", text }
   model: "fixture", stopReason: "stop", timestamp: Date.now(), usage });
 
 export async function rpcFixture(t, options = {}) {
+  const omp = options.host === "omp";
+  const executable = omp ? process.env.PI_TRIAGE_TEST_OMP_BIN ?? "omp" : process.execPath;
   const root = await temporary(t), agent = join(root, "agent"); await mkdir(agent);
   const manager = SessionManager.create(root, join(root, "sessions"));
   manager.appendCustomEntry("knowledge_triage_state", { version: 1, task_id: "task" });
   let kept;
   for (let i = 0; i < 12; i++) {
     kept = manager.appendMessage({ role: "user", content: (i === 0 ? (options.ambiguous ? "Keep the complete audit trail.\n\n" : "Never delete records.\n\n") + "OLD_FACT=alpha\n\n" : "") +
-      `Block ${i}: ` + "Synthetic inventory record with ordinary facts. ".repeat(50), timestamp: Date.now() });
+      `Block ${i}: ` + "Synthetic inventory record with ordinary facts. ".repeat(options.historyRepeat ?? 50), timestamp: Date.now() });
     manager.appendMessage(assistant("Acknowledged."));
   }
   if (options.archive) {
@@ -47,35 +49,38 @@ export async function rpcFixture(t, options = {}) {
       response.writeHead(200, { "Content-Type": "text/event-stream" });
       const chunk = { id: `fixture-${requests.length}`, object: "chat.completion.chunk", model: "fixture", choices: [{ index: 0, delta, finish_reason: null }] };
       response.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      response.end(`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: tool ? "tool_calls" : "stop" }], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } })}\n\ndata: [DONE]\n\n`);
+      response.end(`data: ${JSON.stringify({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: tool ? "tool_calls" : "stop" }], usage: { prompt_tokens: requests.length === 1 ? options.firstPromptTokens ?? 100 : 100, completion_tokens: 10, total_tokens: requests.length === 1 ? (options.firstPromptTokens ?? 100) + 10 : 110 } })}\n\ndata: [DONE]\n\n`);
     } catch (error) { response.writeHead(500); response.end(String(error)); }
   });
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   t.after(() => { server.closeAllConnections(); server.close(); });
-  await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", apiKey: "fixture-only",
+  await writeFile(join(agent, omp ? "models.yml" : "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", apiKey: "fixture-only",
     baseUrl: `http://127.0.0.1:${server.address().port}/v1`, models: [{ id: "fixture", name: "fixture", reasoning: false, input: ["text"],
-      contextWindow: 131072, maxTokens: 32768, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
-  await writeFile(join(agent, "settings.json"), JSON.stringify({ packages: [], retry: { enabled: false },
-    compaction: { enabled: false, keepRecentTokens: 512, reserveTokens: 1024 } }));
-  const env = { PATH: process.env.PATH, HOME: root, LANG: "C.UTF-8", PI_CODING_AGENT_DIR: agent,
+      contextWindow: options.contextWindow ?? 131072, maxTokens: 32768, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] } } }));
+  await writeFile(join(agent, omp ? "config.yml" : "settings.json"), JSON.stringify({ packages: [], retry: { enabled: false },
+    compaction: { enabled: options.automatic ?? false, strategy: "context-full", keepRecentTokens: 512, reserveTokens: 1024, remoteEnabled: false,
+      ...(omp ? { methodOrder: ["knowledge-triage", "soft"] } : {}), ...(options.compaction ?? {}) } }));
+  const env = { PATH: process.env.PATH, HOME: root, LANG: "C.UTF-8", PI_CODING_AGENT_DIR: agent, PI_CONFIG_DIR: join(root, "omp-config"), XDG_CACHE_HOME: join(root, "cache"),
     PI_SKIP_VERSION_CHECK: "1", PI_OFFLINE: "1", PI_TELEMETRY: "0",
     PI_TRIAGE_PYTHON: "/missing/python", PI_TRIAGE_MODEL_DIR: "/missing/model", ...options.env };
   let extension = options.extension ?? join(packageRoot, "src/extension.ts");
   let installed = false;
   if (options.install) {
-    await promisify(execFile)(process.execPath, [piCli, "install", resolve(extension)], { cwd: root, env });
-    const settings = JSON.parse(await readFile(join(agent, "settings.json"), "utf8"));
-    assert.ok(settings.packages.some(value => {
-      const source = typeof value === "string" ? value : value.source;
-      return typeof source === "string" && resolve(agent, source) === resolve(extension);
-    }), JSON.stringify(settings.packages));
+    await promisify(execFile)(executable, [...(omp ? [] : [piCli]), "install", resolve(extension)], { cwd: root, env });
+    if (!omp) {
+      const settings = JSON.parse(await readFile(join(agent, "settings.json"), "utf8"));
+      assert.ok(settings.packages.some(value => {
+        const source = typeof value === "string" ? value : value.source;
+        return typeof source === "string" && resolve(agent, source) === resolve(extension);
+      }), JSON.stringify(settings.packages));
+    }
     installed = true;
   }
-  const args = [piCli, "--provider", "fixture", "--model", "fixture", "--mode", "rpc",
-    "--session", manager.getSessionFile(), "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files",
-    "--no-approve", "--system-prompt", "Answer inventory questions accurately."];
+  const args = [...(omp ? [] : [piCli]), "--provider", "fixture", "--model", "fixture", "--mode", "rpc",
+    (omp ? "--resume" : "--session"), manager.getSessionFile(), "--no-skills",
+    ...(omp ? ["--no-ui", "--no-rules", "--no-lsp", "--no-pty", "--no-title"] : ["--no-prompt-templates", "--no-themes", "--no-approve"]), "--no-context-files", "--system-prompt", "Answer inventory questions accurately."];
   if (!installed) args.push("--no-extensions", "--extension", extension);
-  const child = spawn(process.execPath, args, { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn(executable, args, { cwd: root, env, stdio: ["pipe", "pipe", "pipe"] });
   const events = [], waiters = new Set(); let buffer = "", stderr = "", exited = false, sequence = 0;
   child.stderr.on("data", text => { stderr = (stderr + text).slice(-20000); });
   child.stdout.on("data", text => {
@@ -105,11 +110,11 @@ export async function rpcFixture(t, options = {}) {
     child.stdin.write(JSON.stringify({ ...command, id }) + "\n"); return pending;
   }
   await send({ type: "get_state" });
-  return { root, agent, manager, requests, behavior, events, child, send, wait,
+  return { root, agent, manager, env, requests, behavior, events, child, send, wait,
     async prompt(message) {
       const start = events.length;
       const response = await send({ type: "prompt", message }); assert.equal(response.success, true, JSON.stringify(response));
-      await wait(event => event.type === "agent_settled", start);
+      await wait(event => event.type === (omp ? "session_settled" : "agent_settled"), start);
     },
     async rows() { return (await readFile(manager.getSessionFile(), "utf8")).trim().split("\n").map(JSON.parse); },
     stderr: () => stderr,

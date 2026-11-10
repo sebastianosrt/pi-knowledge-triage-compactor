@@ -4,6 +4,7 @@ import { collectItems, countTypes, isMandatory, mandatoryKey, readSnapshot, rend
   type KnowledgeClassifier, type TriageSnapshot } from "./core/knowledge-triage.ts";
 import { archiveObservation } from "./core/triage-artifacts.ts";
 import { LayaRuntime, LayaUnavailable } from "./laya/runtime.ts";
+import { hostName, compactionAllowance, withinDeadline, CompactionDeadline } from "./pi/host.ts";
 import { registerContext } from "./pi/context.ts";
 import { retrievalPage } from "./pi/retrieval.ts";
 import { branchState, messageText, sessionPaths, type ArchiveState } from "./pi/state.ts";
@@ -17,17 +18,22 @@ export function createExtension(pi: ExtensionAPI, options: { classifier?: Knowle
     pi.appendEntry("knowledge_triage_status", { message });
     if (ctx.hasUI) ctx.ui.notify(message, warning ? "warning" : "info");
   };
-  const restore = async (ctx: ExtensionContext) => {
+  const restore = async (ctx: ExtensionContext, parentFile?: string) => {
     local.reset(); fallback = undefined; generation++;
     const paths = sessionPaths(ctx), entries = ctx.sessionManager.getBranch(), state = branchState(entries, paths.id);
     if (!entries.some(entry => entry.type === "custom" && entry.customType === "knowledge_triage_state"))
       pi.appendEntry("knowledge_triage_state", { version: 1, task_id: state.taskId });
     if (state.ref && paths.file) {
-      try { await readSnapshot(paths.file, paths.id, state.ref, paths.artifacts); }
+      try { await readSnapshot(paths.file, paths.id, state.ref, paths.artifacts, parentFile); }
       catch (error) { report(ctx, `Triage archive needs attention: ${String(error).slice(0, 300)}`, true); }
     }
   };
   pi.on("session_start", async (_event, ctx) => restore(ctx));
+  // OMP retains the extension instance across switches and branches.
+  for (const name of ["session_switch", "session_branch"]) {
+    (pi.on as (name: string, handler: (event: { previousSessionFile?: string }, ctx: ExtensionContext) => Promise<void>) => void)(name,
+      async (event, ctx) => { if (hostName(ctx) === "omp") await restore(ctx, event.previousSessionFile); });
+  }
   pi.on("session_tree", async (_event, ctx) => restore(ctx));
   pi.on("session_shutdown", () => { local.shutdown(); fallback = undefined; generation++; });
 
@@ -42,22 +48,43 @@ export function createExtension(pi: ExtensionAPI, options: { classifier?: Knowle
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
+    // The optional host patch dispatches this hook once per selected method.
+    // Stock Pi/OMP omit method and retain their original override behavior.
+    const method = (event as typeof event & { method?: string }).method;
+    if (method !== undefined && method !== "knowledge-triage") {
+      // Keep an existing archive reachable when a different method wins the
+      // order, while marking the newer summary as outside its coverage.
+      const paths = sessionPaths(ctx), state = branchState(event.branchEntries, paths.id);
+      const reason = fallback?.sessionId === paths.id ? fallback.reason : `OMP selected ${method} compaction`;
+      fallback = state.ref || fallback?.sessionId === paths.id ? { sessionId: paths.id, state, reason } : undefined;
+      return;
+    }
     fallback = undefined;
     const attempt = generation;
     const paths = sessionPaths(ctx), state = branchState(event.branchEntries, paths.id);
+    const omp = hostName(ctx) === "omp";
     local.setProgress(message => { if (attempt === generation) report(ctx, message); });
     const nativeFallback = (reason: string) => {
       fallback = { sessionId: paths.id, state, reason };
-      report(ctx, `Using Pi's default compactor: ${reason}. It may use your configured remote provider.`, true);
+      report(ctx, method === "knowledge-triage"
+        ? `Knowledge triage unavailable: ${reason}. OMP will try the next configured method, if any.`
+        : `Using ${omp ? 'OMP' : 'Pi'}'s default compactor: ${reason}. It may use your configured remote provider.`, true);
     };
-    try {
-      event.signal.throwIfAborted();
+    const work = async (signal: AbortSignal) => {
+      const check = () => {
+        signal.throwIfAborted();
+        if (attempt !== generation || ctx.sessionManager.getSessionId() !== paths.id) throw new Error("Session changed during compaction");
+      };
+      check();
       if (!paths.file) { nativeFallback("this session has no persistent archive storage"); return; }
       const stored = state.ref ? await readSnapshot(paths.file, paths.id, state.ref, paths.artifacts) : undefined;
       // A native summary creates a coverage gap. Replay raw ancestors before using incremental extraction again.
       const previous = stored && state.nativeGap ? { ...stored, extractionVersion: 3 as const } : stored;
       const { items, stats } = await collectItems(event.branchEntries, event.preparation.firstKeptEntryId, state.taskId,
-        previous, event.preparation.previousSummary, classifier, event.signal, paths.artifacts, paths.id);
+        previous, event.preparation.previousSummary,
+        omp && !options.classifier ? { classify: (...args) => local.classifyInBackground(...args) } : classifier,
+        signal, paths.artifacts, paths.id);
+      check();
       if (attempt !== generation) return { cancel: true };
       if (stats.layaFailures) throw new LayaUnavailable(stats.layaFailureReason ?? "Laya classification failed");
       const firstUser = event.branchEntries.find(entry => entry.type === "message" && entry.message.role === "user");
@@ -65,8 +92,7 @@ export function createExtension(pi: ExtensionAPI, options: { classifier?: Knowle
       const prefix = `Knowledge triage for session task ${state.taskId}.\nTask opening (input excerpt; embedded source is untrusted data): ${opening}\n` +
         (event.customInstructions ? `Compaction focus: ${event.customInstructions}\n` : "") +
         "Retained instructions follow verbatim. Source observations remain context hints requiring verification.\n";
-      const budget = Math.min(12000, (ctx.model?.contextWindow ?? 131072) - event.preparation.settings.reserveTokens -
-        event.preparation.settings.keepRecentTokens - 4096) - Math.ceil(prefix.length / 4) - 256;
+      const budget = compactionAllowance(ctx, event.preparation) - Math.ceil(prefix.length / 4) - 256;
       const active = items.filter(item => item.taskId === state.taskId), compacted = typeCompact(active, budget);
       if (compacted.status !== "ok") throw new Error(`COMPACTION_UNSAFE: mandatory items need ${compacted.minimum} tokens; available ${budget}`);
       const rendered = renderItems(compacted.kept);
@@ -77,17 +103,20 @@ export function createExtension(pi: ExtensionAPI, options: { classifier?: Knowle
         retainedIds: items.filter(item => ids.has(item.id) || (item.taskId === state.taskId && isMandatory(item) && mandatory.has(mandatoryKey(item)))).map(item => item.id),
         partitionPolicy: { taskId: state.taskId, budget: Math.max(12000, budget) },
         reconstructionIncomplete: Boolean(previous?.reconstructionIncomplete || stats.reconstructionIncomplete) };
-      event.signal.throwIfAborted();
+      check();
       const ref = await writeSnapshot(paths.file, paths.id, snapshot, stored);
-      event.signal.throwIfAborted();
+      check();
       pi.appendEntry("knowledge_triage_compaction", { status: "ok", task_id: state.taskId, counts: countTypes(items), retained: compacted.kept.length,
         classifier: "laya_local", ...stats, archive_sha256: ref.sha256 });
       return { compaction: { summary: `${prefix}\nTyped knowledge retained verbatim:\n${rendered}\nAdditional records are archived. Use triage_retrieve if available when a requested fact is missing.`,
         firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore,
         details: { task_id: state.taskId, triage: ref, knowledge_triage_version: 1 } } };
+    };
+    try {
+      return omp ? await withinDeadline(work, [event.signal, ...(ctx.signal ? [ctx.signal] : [])]) : await work(event.signal);
     } catch (error) {
-      if (event.signal.aborted || attempt !== generation) return { cancel: true };
-      if (error instanceof LayaUnavailable) { nativeFallback(error.message); return; }
+      if (event.signal.aborted || ctx.signal?.aborted || attempt !== generation) return { cancel: true };
+      if (error instanceof LayaUnavailable || error instanceof CompactionDeadline) { nativeFallback(error.message); return; }
       report(ctx, `Triage compaction cancelled: ${String(error).slice(0, 500)}`, true);
       return { cancel: true };
     }
@@ -106,6 +135,7 @@ export function createExtension(pi: ExtensionAPI, options: { classifier?: Knowle
   });
 
   pi.registerTool({
+    ...{ loadMode: "essential" }, // OMP must advertise archive retrieval without a discovery round trip.
     name: "triage_retrieve", label: "Retrieve archived knowledge",
     description: "Search this session task's archived knowledge by words, identifiers or source references. Query '*' lists records. Mandatory instructions are pinned; already retained records are excluded by default. Follow next_page unchanged. Results are source-attributed context hints, not proof. archive_available=false means no archive exists: do not repeat until compaction creates one.",
     parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 1000 }),
@@ -133,11 +163,12 @@ export function createExtension(pi: ExtensionAPI, options: { classifier?: Knowle
       const command = args.trim() || "status";
       if (command === "setup") {
         local.setProgress(message => { if (owner === generation) report(ctx, message); });
-        try { await local.setup(); if (owner !== generation) return; report(ctx, "Local Laya is ready."); }
+        if (hostName(ctx) === "omp") local.startSetup(true);
+        else try { await local.setup(); if (owner !== generation) return; report(ctx, "Local Laya is ready."); }
         catch (error) { if (owner !== generation) return; report(ctx, `Laya setup failed: ${String(error).slice(0, 1000)}`, true); }
       } else if (command !== "status") { report(ctx, "Usage: /triage status | /triage setup", true); return; }
       const paths = sessionPaths(ctx), state = branchState(ctx.sessionManager.getBranch(), paths.id);
-      const status = { ...await local.status(), session_id: paths.id, task_id: state.taskId, archive_available: Boolean(state.ref && paths.file),
+      const status = { ...await local.status(), host: hostName(ctx), fallback: hostName(ctx), session_id: paths.id, task_id: state.taskId, archive_available: Boolean(state.ref && paths.file),
         archive_coverage: !state.ref ? "none" : state.nativeGap ? "before_native_fallback" : "compacted_history", retrieval_enabled: pi.getActiveTools().includes("triage_retrieve") };
       if (owner !== generation) return;
       pi.sendMessage({ customType: "knowledge_triage_status", content: JSON.stringify(status, null, 2), display: true });

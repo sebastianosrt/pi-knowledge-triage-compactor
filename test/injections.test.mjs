@@ -35,6 +35,29 @@ test("changed retrieval appends once; an identical result for a different query 
   assert.deepEqual(await f.project(), changed);
 });
 
+test("headroom pressure preserves older blocks on continuations and changed queries", async t => {
+  const f = await fixture(t); await f.archive(snapshot([item("a", "alpha"), item("b", "beta")]));
+  const first = await f.inject("alpha"), logs = f.logs.length;
+  f.context.model.contextWindow = 34000;
+  append(f, "large-result", { role: "toolResult", toolCallId: "call", toolName: "read",
+    content: [{ type: "text", text: "x".repeat(16000) }] });
+  const continued = await f.project();
+  assert.deepEqual(continued.messages.slice(0, first.messages.length), first.messages);
+  assert.equal(f.logs.length, logs); // A known query does not need another budget decision.
+  const changed = await f.inject("beta");
+  assert.deepEqual(changed.messages.slice(0, continued.messages.length), continued.messages);
+  assert.deepEqual(blocks(changed), blocks(first));
+  assert.equal(f.context.aborted, undefined);
+  assert.equal(f.logs.at(-1).data.deferred, true);
+  await f.handlers.get("session_start")({}, f.context);
+  assert.deepEqual(await f.project(), changed);
+  f.context.model.contextWindow = 131072;
+  const recovered = await f.project();
+  assert.deepEqual(recovered.messages.slice(0, changed.messages.length), changed.messages);
+  assert.equal(blocks(recovered).length, 2);
+  assert.match(blocks(recovered)[1].content, /beta/);
+});
+
 test("forks cannot inherit injections from a sibling branch", async t => {
   const f = await fixture(t); await f.archive(snapshot([item("a", "alpha"), item("b", "beta")]));
   const first = await f.inject("alpha"), cut = f.branch.length;

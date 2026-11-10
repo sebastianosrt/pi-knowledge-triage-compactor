@@ -1,0 +1,227 @@
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+index 35a4eae..e7e8e68 100644
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ ## [Unreleased]
+ 
++### Added
++
++- Select Knowledge triage in Compaction Method Order to run the Knowledge Triage Compactor extension at its configured priority, with fallback to the next method when unavailable.
++
+ ## [18.18.6] - 2026-11-09
+ 
+ ### Added
+diff --git a/packages/coding-agent/src/extensibility/shared-events.ts b/packages/coding-agent/src/extensibility/shared-events.ts
+index 96325f0..74547c2 100644
+--- a/packages/coding-agent/src/extensibility/shared-events.ts
++++ b/packages/coding-agent/src/extensibility/shared-events.ts
+@@ -16,6 +16,7 @@ import { type AgentMessage, isNonBlankContext, joinAdditionalContext } from "@oh
+ import type { CompactionPreparation, CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
+ import type { AssistantRetryRecovery, ImageContent, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+ import type { Rule } from "../capability/rule";
++import type { CompactionMethod } from "../session/compaction-methods";
+ import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
+ import type { GoalModeState } from "../goals/state";
+ import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "../session/session-entries";
+@@ -76,6 +77,8 @@ export interface SessionBranchEvent {
+ /** Fired before context compaction (can be cancelled or customized) */
+ export interface SessionBeforeCompactEvent {
+ 	type: "session_before_compact";
++	/** Selected method; experimental rollover bypasses the ordered method list. */
++	method?: CompactionMethod | "experimental";
+ 	/** Compaction preparation with messages to summarize, file ops, previous summary, etc. */
+ 	preparation: CompactionPreparation;
+ 	/** Branch entries (root to current leaf). Use to inspect custom state or previous compactions. */
+diff --git a/packages/coding-agent/src/session/compaction-methods.ts b/packages/coding-agent/src/session/compaction-methods.ts
+index 64aaf51..a61db9b 100644
+--- a/packages/coding-agent/src/session/compaction-methods.ts
++++ b/packages/coding-agent/src/session/compaction-methods.ts
+@@ -10,6 +10,12 @@ import type { CompactionSettings } from "./context-settings";
+ 
+ /** Choices presented by the ordered compaction-method setting. */
+ export const COMPACTION_METHOD_CHOICES = [
++	{
++		value: "knowledge-triage",
++		label: "Knowledge triage",
++		description:
++			"Retain typed knowledge locally with a searchable archive; requires the Knowledge Triage Compactor extension",
++	},
+ 	{
+ 		value: "remote",
+ 		label: "Server compaction",
+@@ -51,6 +57,7 @@ export const DEFAULT_COMPACTION_METHOD_ORDER: CompactionMethod[] = [
+ ];
+ 
+ const COMPACTION_METHODS: Record<CompactionMethod, true> = {
++	"knowledge-triage": true,
+ 	remote: true,
+ 	snapcompact: true,
+ 	handoff: true,
+@@ -78,6 +85,7 @@ export function resolveCompactionMethodOrder(value: unknown): CompactionMethod[]
+ }
+ 
+ const STRATEGY_BY_COMPACTION_METHOD: Record<CompactionMethod, "context-full" | "handoff" | "shake" | "snapcompact"> = {
++	"knowledge-triage": "context-full",
+ 	remote: "context-full",
+ 	snapcompact: "snapcompact",
+ 	handoff: "handoff",
+diff --git a/packages/coding-agent/src/session/session-maintenance.ts b/packages/coding-agent/src/session/session-maintenance.ts
+index 2ff97de..2e1c4c3 100644
+--- a/packages/coding-agent/src/session/session-maintenance.ts
++++ b/packages/coding-agent/src/session/session-maintenance.ts
+@@ -1364,6 +1364,7 @@ export class SessionMaintenance {
+ 							explicitSnapcompact ||
+ 							(!customInstructions && !options?.internalGuidance && sendsImageInputOnWire(activeModel))
+ 						);
++					case "knowledge-triage":
+ 					case "soft":
+ 						return true;
+ 					case "handoff":
+@@ -1438,6 +1439,7 @@ export class SessionMaintenance {
+ 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+ 				const result = (await this.#host.extensionRunner.emit({
+ 					type: "session_before_compact",
++					method: selectedMethod,
+ 					preparation,
+ 					branchEntries: pathEntries,
+ 					customInstructions,
+@@ -1454,6 +1456,11 @@ export class SessionMaintenance {
+ 				}
+ 			}
+ 
++			if (selectedMethod === "knowledge-triage" && !hookCompaction) {
++				methodAttempted = true;
++				throw new Error("Knowledge triage is unavailable or declined compaction");
++			}
++
+ 			const compactionPrep = await this.#prepareCompactionFromHooks(
+ 				preparation,
+ 				hookCompaction,
+@@ -1662,7 +1669,7 @@ export class SessionMaintenance {
+ 				details,
+ 				fromExtension,
+ 				preserveData,
+-				method: fromExtension ? undefined : selectedMethod,
++				method: fromExtension && selectedMethod !== "knowledge-triage" ? undefined : selectedMethod,
+ 				codexCompaction,
+ 				providerReplayThroughEntryId,
+ 				advisorResetReason: "compact",
+@@ -1799,6 +1806,7 @@ export class SessionMaintenance {
+ 		if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+ 			const hookResult = (await this.#host.extensionRunner.emit({
+ 				type: "session_before_compact",
++				method: "experimental",
+ 				preparation,
+ 				branchEntries: entries,
+ 				customInstructions: undefined,
+@@ -1929,6 +1937,7 @@ export class SessionMaintenance {
+ 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+ 				const hookResult = (await this.#host.extensionRunner.emit({
+ 					type: "session_before_compact",
++					method: "experimental",
+ 					preparation,
+ 					branchEntries: this.#host.sessionManager.getBranch(),
+ 					customInstructions: undefined,
+@@ -5296,10 +5305,10 @@ export class SessionMaintenance {
+ 		// in the background. Claiming consumes the slot either way: an in-flight
+ 		// run is aborted (this real pass supersedes it) and an armed result is
+ 		// returned only when still valid for the current branch/model/settings.
+-		// Snapcompact is local and instant, so an armed LLM summary (possible
+-		// only when settings/model changed since arming) never overrides it.
++		// Local methods must not be replaced by an armed LLM summary left over
++		// from a previous settings/model selection.
+ 		const claimedSpec = this.#claimArmedSpeculation(options.triggerContextTokens, options.pendingContextTokens);
+-		const armedSpec = method === "snapcompact" ? undefined : claimedSpec;
++		const armedSpec = method === "snapcompact" || method === "knowledge-triage" ? undefined : claimedSpec;
+ 
+ 		const effectiveSettings = resolveMethodSettings(compactionSettings, method);
+ 		const fallbackFromShake = options.fallbackFromShake === true;
+@@ -5578,6 +5587,7 @@ export class SessionMaintenance {
+ 			if (this.#host.extensionRunner?.hasHandlers("session_before_compact")) {
+ 				const hookResult = (await this.#host.extensionRunner.emit({
+ 					type: "session_before_compact",
++					method,
+ 					preparation,
+ 					branchEntries: pathEntriesForCompaction,
+ 					customInstructions: undefined,
+@@ -5604,6 +5614,10 @@ export class SessionMaintenance {
+ 				}
+ 			}
+ 
++			if (method === "knowledge-triage" && !hookCompaction) {
++				throw new Error("Knowledge triage is unavailable or declined compaction");
++			}
++
+ 			const compactionPrep = await this.#prepareCompactionFromHooks(
+ 				preparation,
+ 				hookCompaction,
+@@ -6110,7 +6124,7 @@ export class SessionMaintenance {
+ 				tokensBefore: candidateTokensBefore,
+ 				details,
+ 				preserveData,
+-				method: fromExtension ? undefined : method,
++				method: fromExtension && method !== "knowledge-triage" ? undefined : method,
+ 				providerReplayThroughEntryId,
+ 			});
+ 			if (
+@@ -6182,7 +6196,7 @@ export class SessionMaintenance {
+ 				preserveData,
+ 				fromExtension,
+ 				codexCompaction,
+-				method: fromExtension ? undefined : method,
++				method: fromExtension && method !== "knowledge-triage" ? undefined : method,
+ 				providerReplayThroughEntryId,
+ 				action,
+ 				reason,
+diff --git a/packages/coding-agent/test/modes/components/settings-selector-triage.test.ts b/packages/coding-agent/test/modes/components/settings-selector-triage.test.ts
+new file mode 100644
+index 0000000..2e4b3db
+--- /dev/null
++++ b/packages/coding-agent/test/modes/components/settings-selector-triage.test.ts
+@@ -0,0 +1,44 @@
++import { afterEach, beforeAll, expect, test } from "bun:test";
++import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { createSettingsHost } from "@oh-my-pi/pi-coding-agent/config/settings-ui";
++import { createPluginSettingsHost } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/settings-host";
++import { cfgCompactionMethodOrder } from "@oh-my-pi/pi-coding-agent/session/context-settings";
++import { SettingsSelectorComponent } from "@oh-my-pi/pi-tui/overlays/settings-selector";
++import { initTheme } from "@oh-my-pi/pi-tui/theme";
++
++beforeAll(async () => {
++	await initTheme();
++});
++afterEach(() => {
++	resetSettingsForTest();
++});
++
++test("Compaction Method Order can enable triage, move it first, and retain the order when reopened", async () => {
++	resetSettingsForTest();
++	await Settings.init({ inMemory: true });
++	cfgCompactionMethodOrder.set(settings, ["soft", "remote"]);
++	const createSelector = () =>
++		new SettingsSelectorComponent(
++			{
++				availableThinkingLevels: [],
++				thinkingLevel: undefined,
++				availableThemes: ["dark"],
++				providers: [],
++				settings: createSettingsHost(),
++				plugins: createPluginSettingsHost(process.cwd()),
++			},
++			{ onChange: () => {}, onCancel: () => {} },
++		);
++	const selector = createSelector();
++	for (const ch of "compaction method order") selector.handleInput(ch);
++	selector.render(120);
++	selector.handleInput("\n");
++	expect(selector.render(120).join("\n")).toContain("Knowledge triage");
++	selector.handleInput(" ");
++	selector.handleInput("1");
++	selector.handleInput("\x1b");
++	expect(cfgCompactionMethodOrder.get(settings)).toEqual(["knowledge-triage", "soft", "remote"]);
++	const reopened = createSelector();
++	for (const ch of "compaction method order") reopened.handleInput(ch);
++	expect(reopened.render(120).join("\n")).toContain("Knowledge triage");
++});

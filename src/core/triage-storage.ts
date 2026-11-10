@@ -96,25 +96,28 @@ async function header(file: string): Promise<{ id: string; parentSession?: strin
   const handle = await open(file, "r");
   try {
     const buffer = Buffer.alloc(65536), { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    const end = buffer.subarray(0, bytesRead).indexOf(10);
-    if (end < 0) throw new Error("Invalid Pi session header");
-    const parsed = JSON.parse(buffer.subarray(0, end).toString("utf8"));
+    const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
+    if (lines.length < 2) throw new Error("Invalid Pi session header");
+    let parsed = JSON.parse(lines[0]);
+    // OMP stores a fixed-width title slot before the ordinary v3 header.
+    if (parsed.type === "title" && parsed.v === 1 && lines.length >= 3) parsed = JSON.parse(lines[1]);
     if (parsed.type !== "session" || typeof parsed.id !== "string") throw new Error("Invalid Pi session header");
     return parsed;
   } finally { await handle.close(); }
 }
 
-async function importFiles(file: string, id: string, ref: SnapshotRef, ancestors: Set<string>): Promise<void> {
+async function importFiles(file: string, id: string, ref: SnapshotRef, ancestors: Set<string>, parentFile?: string): Promise<void> {
   if (ancestors.has(file) || ancestors.size >= 32) throw new Error("Invalid Pi session ancestry");
   ancestors.add(file);
   const own = await header(file);
-  if (own.id !== id || !own.parentSession || !isAbsolute(own.parentSession)) throw new Error("Missing triage snapshot and parent session");
-  const parent = await header(own.parentSession), parentRoot = directory(own.parentSession, parent.id);
+  const source = parentFile ?? own.parentSession;
+  if (own.id !== id || !source || !isAbsolute(source)) throw new Error("Missing triage snapshot and parent session");
+  const parent = await header(source), parentRoot = directory(source, parent.id);
   const parentPath = join(parentRoot, ref.file);
   try { await stat(parentPath); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    await importFiles(own.parentSession, parent.id, ref, ancestors);
+    await importFiles(source, parent.id, ref, ancestors);
   }
   const body = await readFile(parentPath);
   if (contentHash(body) !== ref.sha256) throw new Error("Triage snapshot checksum mismatch");
@@ -132,7 +135,7 @@ async function importFiles(file: string, id: string, ref: SnapshotRef, ancestors
   await atomicContent(directory(file, id), ref.file, body);
 }
 
-export async function readSnapshot(file: string, id: string, ref: SnapshotRef, artifactDirectory?: string): Promise<TriageSnapshot> {
+export async function readSnapshot(file: string, id: string, ref: SnapshotRef, artifactDirectory?: string, parentFile?: string): Promise<TriageSnapshot> {
   if (![1, 2].includes(ref.version) || !validRef(ref)) throw new Error("Invalid triage snapshot reference");
   const root = directory(file, id), path = join(root, ref.file);
   const artifacts = artifactDirectory ?? join(dirname(file), "artifacts", id);
@@ -141,7 +144,7 @@ export async function readSnapshot(file: string, id: string, ref: SnapshotRef, a
   try { info = await signature([path]); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    await importFiles(file, id, ref, new Set()); info = await signature([path]);
+    await importFiles(file, id, ref, new Set(), parentFile); info = await signature([path]);
   }
   const cached = cacheGet<{ files: string[]; signature: string; snapshot: TriageSnapshot }>(owner, "snapshot");
   if (cached && `${info};${await signature(cached.files)}` === cached.signature) return cached.snapshot;

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { ContextEvent, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 
+import { sessionProjection, messageIdentity } from "./host.ts";
+
 type Message = ContextEvent["messages"][number];
 export const INJECTION = "knowledge_triage_injection";
 export const BINDING = "knowledge_triage_injection_use";
@@ -11,9 +13,7 @@ export interface Injection {
   query_sha256: string; anchor: Anchor; content: string; content_sha256: string; timestamp: number;
 }
 const anchorKey = (a: Anchor) => `${a.entry_id}:${a.message_index}`;
-const identity = (message: Message) => JSON.stringify([message.role, message.timestamp,
-  "customType" in message ? message.customType : null,
-  "toolCallId" in message ? message.toolCallId : null]);
+const identity = messageIdentity;
 const fingerprint = (message: Message) => sha256(JSON.stringify(message));
 
 /** Resolve source-entry anchors against Pi's request projection, including preceding extension edits.
@@ -23,7 +23,7 @@ const fingerprint = (message: Message) => sha256(JSON.stringify(message));
 export function injectionContext(ctx: ExtensionContext, input: Message[], branch: SessionEntry[], taskId: string) {
   const messages = input.filter(message => !(message.role === "custom" &&
     message.customType === "knowledge_triage_context" && (message.details as any)?.triage_injection_id));
-  const projection = ctx.sessionManager.buildSessionProjection();
+  const projection = sessionProjection(ctx, branch);
   const positions = new Map<string, number>();
   const visible = new Set<string>();
   const full = messages.map(fingerprint), identities = messages.map(identity);
@@ -77,14 +77,13 @@ export function injectionContext(ctx: ExtensionContext, input: Message[], branch
       display: false, timestamp: record.timestamp, details: { triage_injection_id: record.id },
     }))]);
   }
-  function lastAnchor(): Anchor {
+  function lastAnchor(): Anchor | undefined {
     let best: { anchor: Anchor; index: number } | undefined;
     for (const entry of projection.entries) entry.messages.forEach((_message, ordinal) => {
       const anchor = { entry_id: entry.sourceEntry.id, message_index: ordinal }, index = positions.get(anchorKey(anchor));
       if (index !== undefined && (!best || index > best.index)) best = { anchor, index };
     });
-    if (!best) throw new Error("COMPACTION_UNSAFE: no persistent archived-context anchor");
-    return best.anchor;
+    return best?.anchor;
   }
   return { messages, records, known, render, lastAnchor };
 }

@@ -1,0 +1,210 @@
+diff --git a/packages/coding-agent/src/utils/title-generator.ts b/packages/coding-agent/src/utils/title-generator.ts
+index 354065b..1d50aaa 100644
+--- a/packages/coding-agent/src/utils/title-generator.ts
++++ b/packages/coding-agent/src/utils/title-generator.ts
+@@ -23,7 +23,7 @@ import { $env, isTerminalHeadless, isWsl, logger, prompt } from "@oh-my-pi/pi-ut
+ import type { ModelRegistry } from "../config/model-registry";
+ 
+ import { roleCandidatePool } from "../config/model-roles";
+-import { formatModelStringWithRouting } from "../config/model-resolver";
++import { formatModelStringWithRouting, resolveModelOverride } from "../config/model-resolver";
+ import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
+ import type { Settings } from "../config/settings";
+ import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
+@@ -31,6 +31,7 @@ import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "
+ import { formatTitleUserMessage } from "../tiny/message-preproc";
+ import { isLowSignalTitleInput, normalizeGeneratedTitle } from "../tiny/text";
+ import { tinyTitleClient } from "../tiny/title-client";
++import { cfgTitleModelFallback } from "./title-settings";
+ 
+ import { cfgRetryModelFallback } from "../session/settings";
+ import { DEFAULT_SPINNER_INTERVAL_MS, SPINNER_INTERVAL_STATIC } from "@oh-my-pi/pi-tui/spinner-clock";
+@@ -156,6 +157,17 @@ const LEADING_PROSE_THINKING_PREAMBLE_RE =
+ function getTitleModels(registry: ModelRegistry, settings: Settings, currentModel?: Model<Api>): Model<Api>[] {
+ 	const availableModels = roleCandidatePool("tiny", settings, registry);
+ 	if (availableModels.length === 0) return [];
++	if (!cfgTitleModelFallback.get(settings)) {
++		// A separate title endpoint can protect a single-slot conversation cache.
++		// Missing selectors must not silently pick a default, fuzzy match, role,
++		// or retry-chain candidate that could reach the conversation backend.
++		const selector = settings.getModelRoles().tiny;
++		if (!selector) return [];
++		const { model } = resolveModelOverride([selector], { getAvailable: () => availableModels }, settings, {
++			exactOnly: true,
++		});
++		return model ? [model] : [];
++	}
+ 
+ 	const models = collectOnlineTinyCandidates(["tiny", "commit", "smol"], settings, availableModels).map(
+ 		candidate => candidate.model,
+diff --git a/packages/coding-agent/src/utils/title-settings.ts b/packages/coding-agent/src/utils/title-settings.ts
+index 5a3b679..868c0b9 100644
+--- a/packages/coding-agent/src/utils/title-settings.ts
++++ b/packages/coding-agent/src/utils/title-settings.ts
+@@ -54,6 +54,19 @@ export const cfgTitleGenerator = register({
+ 	},
+ });
+ 
++export const cfgTitleModelFallback = register({
++	id: "title.modelFallback",
++	type: "boolean",
++	default: true,
++	ui: {
++		tab: "tasks",
++		group: "Modes",
++		label: "Title Model Fallback",
++		description:
++			"Allow tiny titles to try other models; when off, require an exact provider/model in the tiny role and skip failed titles",
++	},
++});
++
+ export const cfgTitleRefreshOnReplan = register({
+ 	id: "title.refreshOnReplan",
+ 	type: "boolean",
+diff --git a/packages/coding-agent/CHANGELOG.md b/packages/coding-agent/CHANGELOG.md
+--- a/packages/coding-agent/CHANGELOG.md
++++ b/packages/coding-agent/CHANGELOG.md
+@@ -5,6 +5,7 @@
+ ### Added
+ 
+ - Select Knowledge triage in Compaction Method Order to run the Knowledge Triage Compactor extension at its configured priority, with fallback to the next method when unavailable.
++- Disable Title Model Fallback to keep tiny titles on their explicitly configured model, including when the title server fails.
+ 
+ ## [18.18.6] - 2026-11-09
+ 
+diff --git a/packages/coding-agent/test/title-model-isolation.test.ts b/packages/coding-agent/test/title-model-isolation.test.ts
+new file mode 100644
+--- /dev/null
++++ b/packages/coding-agent/test/title-model-isolation.test.ts
+@@ -0,0 +1,131 @@
++import { afterEach, describe, expect, it, vi } from "bun:test";
++import * as ai from "@oh-my-pi/pi-ai";
++import { buildModel } from "@oh-my-pi/pi-catalog/build";
++import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
++import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import { generateSessionTitle, generateTitleOnline } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
++import { createAssistantMessage } from "./helpers/agent-session-setup";
++
++const titleModel = buildModel({
++	id: "title:1b",
++	name: "Title model",
++	provider: "title-server",
++	api: "openai-completions",
++	baseUrl: "http://127.0.0.1:52625/v1",
++	reasoning: false,
++	input: ["text"],
++	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++	contextWindow: 8192,
++	maxTokens: 1024,
++});
++const mainModel = buildModel({ ...titleModel, compat: {}, provider: "main-server", id: "main" });
++const titleSelector = `${titleModel.provider}/${titleModel.id}`;
++const mainSelector = `${mainModel.provider}/${mainModel.id}`;
++const registry = {
++	getAvailable: () => [titleModel, mainModel],
++	getApiKey: async () => "test-key",
++	resolver: () => async () => "test-key",
++} as unknown as ModelRegistry;
++
++function settings(tiny: string | undefined = titleSelector): Settings {
++	return Settings.isolated({
++		modelRoles: { ...(tiny ? { tiny } : {}), commit: mainSelector, smol: mainSelector },
++		"title.modelFallback": false,
++		"retry.modelFallback": true,
++		"retry.fallbackChains": { tiny: [mainSelector], [titleSelector]: [mainSelector] },
++	});
++}
++
++afterEach(() => vi.restoreAllMocks());
++
++describe("isolated title model", () => {
++	it("uses the exact configured model, including a colon in its id", async () => {
++		const complete = vi
++			.spyOn(ai, "completeSimple")
++			.mockResolvedValue(createAssistantMessage("<title>Fix cache reuse</title>"));
++		const title = await generateSessionTitle("Fix repeated cache misses", registry, settings(), undefined, mainModel);
++		expect(title).toBe("Fix cache reuse");
++		expect(complete.mock.calls.map(call => call[0])).toEqual([titleModel]);
++	});
++
++	it.each(["", "title-server/missing", "title", "@smol"])(
++		"skips titles for unresolved selector %j without choosing the main model",
++		async selector => {
++			const complete = vi
++				.spyOn(ai, "completeSimple")
++				.mockResolvedValue(createAssistantMessage("<title>Unexpected fallback</title>"));
++			expect(
++				await generateSessionTitle("Fix repeated cache misses", registry, settings(selector), undefined, mainModel),
++			).toBeNull();
++			expect(complete).not.toHaveBeenCalled();
++		},
++	);
++
++	it.each([generateSessionTitle, generateTitleOnline])(
++		"prevents provider and role fallback through %p",
++		async generate => {
++			const complete = vi.spyOn(ai, "completeSimple").mockResolvedValue({
++				...createAssistantMessage(""),
++				stopReason: "error",
++				errorStatus: 400,
++				errorMessage: "Title model unavailable",
++			});
++			expect(await generate("Fix repeated cache misses", registry, settings(), undefined, mainModel)).toBeNull();
++			expect(complete.mock.calls.map(call => call[0])).toEqual([titleModel]);
++		},
++	);
++
++	it("does not fall back when the title server produces no visible title", async () => {
++		const complete = vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("<title/>"));
++		expect(
++			await generateSessionTitle("Fix repeated cache misses", registry, settings(), undefined, mainModel),
++		).toBeNull();
++		expect(complete.mock.calls.map(call => call[0])).toEqual([titleModel]);
++	});
++
++	it("retries transient failures on the same title model", async () => {
++		const complete = vi
++			.spyOn(ai, "completeSimple")
++			.mockResolvedValueOnce({
++				...createAssistantMessage(""),
++				stopReason: "error",
++				errorStatus: 503,
++				errorMessage: "Service unavailable",
++			})
++			.mockResolvedValue(createAssistantMessage("<title>Fix cache reuse</title>"));
++		expect(await generateSessionTitle("Fix repeated cache misses", registry, settings(), undefined, mainModel)).toBe(
++			"Fix cache reuse",
++		);
++		expect(complete.mock.calls.map(call => call[0])).toEqual([titleModel, titleModel]);
++	});
++
++	it("does not send a title to the main model after a connection failure", async () => {
++		const complete = vi.spyOn(ai, "completeSimple").mockRejectedValue(new Error("ECONNREFUSED"));
++		expect(
++			await generateSessionTitle("Fix repeated cache misses", registry, settings(), undefined, mainModel),
++		).toBeNull();
++		expect(complete.mock.calls.map(call => call[0])).toEqual([titleModel]);
++	}, 10_000);
++
++	it("stops title retries when the session title deadline expires", async () => {
++		const signal = AbortSignal.timeout(20);
++		const complete = vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
++			await Bun.sleep(40);
++			return { ...createAssistantMessage(""), stopReason: "aborted" };
++		});
++		expect(
++			await generateSessionTitle(
++				"Fix repeated cache misses",
++				registry,
++				settings(),
++				undefined,
++				mainModel,
++				undefined,
++				undefined,
++				signal,
++			),
++		).toBeNull();
++		expect(signal.aborted).toBe(true);
++		expect(complete.mock.calls.map(call => call[0])).toEqual([titleModel]);
++	});
++});

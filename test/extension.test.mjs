@@ -67,8 +67,51 @@ test("automatic retrieval fits complete records and respects context headroom wi
   assert.match(text, /Never delete records/); assert.match(text, /needle exact/);
   assert.ok(!text.includes("x".repeat(9000))); assert.ok(text.length <= 8000);
   f.context.model.contextWindow = 34000;
-  await assert.rejects(f.inject("needle"), /COMPACTION_UNSAFE/);
-  assert.equal(f.context.model.maxTokens, 32768); assert.equal(f.context.aborted, true);
+  const continued = await f.inject("needle");
+  assert.deepEqual(continued.messages.slice(0, result.messages.length), result.messages);
+  assert.equal(f.context.model.maxTokens, 32768); assert.equal(f.context.aborted, undefined);
+});
+
+test("exhausted headroom defers fresh retrieval without freezing it or interrupting the session", async t => {
+  const f = await fixture(t);
+  await f.archive(snapshot([item("rule", "Never delete records.", "constraint"), item("fact", "needle exact")]));
+  f.context.model.contextWindow = 34000;
+  const deferred = await f.inject("needle");
+  assert.ok(deferred.messages.every(message => message.customType !== "knowledge_triage_context"));
+  assert.equal(f.context.aborted, undefined);
+  assert.equal(f.logs.at(-1).data.deferred, true);
+  assert.equal(f.logs.at(-1).data.budget_chars, 0);
+  assert.equal(f.logs.some(row => row.name === "knowledge_triage_injection_use"), false);
+  assert.equal((await f.retrieve({ query: "needle" })).matches[0].text, "needle exact");
+  f.context.model.contextWindow = 131072;
+  const retried = await f.project();
+  assert.match(retried.messages.at(-1).content, /Never delete records/);
+  assert.match(retried.messages.at(-1).content, /needle exact/);
+  assert.deepEqual(await f.project(), retried);
+});
+
+test("automatic pinned overflow defers whole records and leaves explicit retrieval available", async t => {
+  const f = await fixture(t), rule = "Never " + "x".repeat(9000);
+  await f.archive(snapshot([item("rule", rule, "constraint"), item("fact", "needle exact")]));
+  const result = await f.inject("needle");
+  assert.ok(result.messages.every(message => message.customType !== "knowledge_triage_context"));
+  assert.equal(f.context.aborted, undefined);
+  assert.equal(f.logs.at(-1).data.deferred, true);
+  assert.equal(f.logs.at(-1).data.truncation_reason, "character_budget");
+  assert.equal((await f.retrieve({ query: "needle" })).pinned[0].text, rule);
+});
+
+test("pinned records retry intact after insufficient positive headroom", async t => {
+  const f = await fixture(t), rule = "Never " + "x".repeat(4000);
+  await f.archive(snapshot([item("rule", rule, "constraint"), item("fact", "needle exact")]));
+  f.context.model.contextWindow = 38000;
+  const result = await f.inject("needle");
+  assert.ok(result.messages.every(message => message.customType !== "knowledge_triage_context"));
+  const log = f.logs.at(-1).data;
+  assert.equal(log.deferred, true); assert.ok(log.budget_chars > 0);
+  assert.equal(log.truncation_reason, "context_headroom");
+  f.context.model.contextWindow = 131072;
+  assert.ok((await f.project()).messages.at(-1).content.includes(rule));
 });
 
 test("rare identifier retrieval covers diverse requested records and remains task scoped", () => {

@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { createWriteStream } from "node:fs";
-import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants, createWriteStream } from "node:fs";
+import { access, chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -86,6 +86,21 @@ export async function installRuntime(root: string, signal: AbortSignal, progress
   } finally { await rm(staging, { recursive: true, force: true }); }
 }
 
+/** A compiled OMP executable is not a general-purpose JavaScript interpreter. */
+export async function setupNode(): Promise<string> {
+  if (!(process.versions as Record<string, string | undefined>).bun) return process.execPath;
+  for (const directory of (process.env.PATH ?? "").split(delimiter).filter(isAbsolute)) {
+    const node = join(directory, "node");
+    try {
+      await access(node, constants.X_OK);
+      const version = await run(node, ["--version"], { env: { PATH: process.env.PATH }, timeout: 5000 });
+      const match = /^v(\d+)\.(\d+)\.(\d+)/.exec(version.trim());
+      if (match && (+match[1] > 22 || (+match[1] === 22 && +match[2] >= 19))) return node;
+    } catch { /* Try the next executable on PATH. */ }
+  }
+  throw new Error("OMP managed Laya setup requires Node.js >=22.19 on PATH");
+}
+
 export async function ensureRuntime(root: string, signal: AbortSignal, progress: (text: string) => void, repair = false): Promise<LayaConfig> {
   signal.throwIfAborted();
   const installed = await installedRuntime(root); if (installed && !repair) return installed;
@@ -94,7 +109,7 @@ export async function ensureRuntime(root: string, signal: AbortSignal, progress:
   const lock = await open(join(root, "setup.lock"), "a", 0o600); await lock.close();
   progress("Preparing Laya; another Pi session may already be installing it…");
   // Kernel-owned lock: a crash or cancellation releases it, without stale PID races.
-  await run("flock", ["--exclusive", "--wait", "1800", join(root, "setup.lock"), process.execPath,
+  await run("flock", ["--exclusive", "--wait", "1800", join(root, "setup.lock"), await setupNode(),
     "--experimental-strip-types", join(scripts, "install-runtime.ts"), root, ...(repair ? ["--repair"] : [])], {
     env: { ...setupEnvironment(root), PI_TRIAGE_SETUP_CHILD: "1" }, signal, output: text => { for (const line of text.trim().split("\n")) if (line) progress(line); },
   });

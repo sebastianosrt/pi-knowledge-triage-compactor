@@ -35,12 +35,34 @@ test("actual Pi native compactor receives Laya failure instead of cancellation",
   assert.ok(rows.some(row => row.customType === "knowledge_triage_fallback" && /worker|ENOENT/.test(row.data.reason)));
 });
 
-for (const failure of ["corrupt", "oversized"]) test(`actual Pi blocks provider requests when archived context is ${failure}`, { timeout: 60000 }, async t => {
-  const f = await rpcFixture(t, { archive: true, [failure]: true });
+test("actual Pi blocks provider requests when archived context is corrupt", { timeout: 60000 }, async t => {
+  const f = await rpcFixture(t, { archive: true, corrupt: true });
   await f.prompt("Recall OBS_0.");
   assert.equal(f.requests.length, 0, f.stderr());
   assert.ok((await f.rows()).some(row => row.customType === "knowledge_triage_error" && row.data.stage === "context"));
 });
+
+for (const options of [{ contextWindow: 34000 }, { oversized: true }])
+  test(`actual Pi continues with deferred automatic retrieval: ${JSON.stringify(options)}`, { timeout: 60000 }, async t => {
+    const f = await rpcFixture(t, { archive: true, ...options });
+    f.behavior.tool = true;
+    await f.prompt("Recall OBS_0.");
+    assert.equal(f.requests.length, 2, f.stderr());
+    assert.ok(f.events.some(event => event.type === "tool_execution_end" && event.toolName === "triage_retrieve"));
+    const rows = await f.rows();
+    assert.ok(rows.some(row => row.customType === "knowledge_triage_retrieval" && row.data.deferred));
+    assert.ok(!rows.some(row => row.customType === "knowledge_triage_error"));
+    const retrieved = rows.find(row => row.message?.toolName === "triage_retrieve").message;
+    assert.equal(retrieved.isError, false);
+    assert.equal(retrieved.details.result.archive_available, true);
+    if (options.oversized) assert.equal(retrieved.details.result.pinned[0].text, "Never " + "x".repeat(9000));
+    else assert.match(retrieved.content[0].text, /exact_value=0/);
+    assert.ok(!f.stderr().includes("COMPACTION_UNSAFE"), f.stderr());
+    const state = await f.send({ type: "get_state" });
+    assert.equal(state.data.model.maxTokens, 32768);
+    const requested = f.requests[0].max_tokens ?? f.requests[0].max_completion_tokens;
+    assert.ok(requested > 0 && requested <= 32768); // Pi can clamp output to its remaining context.
+  });
 
 test("npm tarball installs through Pi package discovery and exposes retrieval", { timeout: 60000 }, async t => {
   const root = await temporary(t), installed = join(root, "installed"); await mkdir(installed);
